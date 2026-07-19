@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.installed.cfg
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env/
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Index data (large, machine-generated)
+data/
+*.pkl
+*.faiss
+*.index
+*.bin
+
+# Model weights (download on demand)
+models/
+*.safetensors
+*.pt
+*.ckpt
+*.onnx
+
+# HuggingFace cache
+.cache/
+~/.cache/huggingface/
+
+# Logs
+logs/
+*.log
+*.log.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Playwright
+playwright-report/
+test-results/
+
+# Docker
+.docker/
+
+# OS
+*.bak
+*.tmp
