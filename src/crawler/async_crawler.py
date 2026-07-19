@@ -1,220 +1,288 @@
 """
-Content extraction pipeline.
+Async web crawler.
 
-Turns raw HTML into structured, clean text using a cascade:
-  1. trafilatura  (best at article/blog content)
-  2. readability  (fallback for more structured pages)
-  3. raw BS4 body text (last resort)
-
-Also extracts metadata: title, description, publish date, language,
-canonical URL, author, outlinks.
+- Breadth-first frontier with per-domain rate limiting
+- Politeness: respects robots.txt, Crawl-Delay, configurable delay
+- Retry logic with exponential back-off (tenacity)
+- Deduplication via xxhash URL fingerprinting
+- Streams CrawlResult objects to an async queue consumed by the indexer
 """
 
 from __future__ import annotations
 
-import re
+import asyncio
+import time
 from dataclasses import dataclass, field
-from typing import Optional
-from urllib.parse import urlparse
+from typing import AsyncIterator, Set
+from urllib.parse import urljoin, urlparse
 
-import trafilatura
-from bs4 import BeautifulSoup
+import aiohttp
+import xxhash
 from loguru import logger
-from readability import Document
+from tenacity import retry, stop_after_attempt, wait_exponential
 
-from .async_crawler import CrawlResult
+from .robots import RobotsCache
 
 # ---------------------------------------------------------------------------
-# Output model
+# Data model
 # ---------------------------------------------------------------------------
 
 @dataclass
-class ExtractedPage:
+class CrawlResult:
     url: str
-    canonical_url: str
-    title: str
-    text: str                       # main body text, clean
-    description: str = ""
-    author: str = ""
-    language: str = "en"
-    publish_date: str = ""
-    outlinks: list[str] = field(default_factory=list)
-    word_count: int = 0
-    char_count: int = 0
-    # Quality signals
-    link_density: float = 0.0      # links / total words
-    avg_sentence_len: float = 0.0
+    status: int
+    html: str
+    content_type: str
+    crawled_at: float = field(default_factory=time.time)
+    final_url: str = ""          # after redirects
+    depth: int = 0
+    parent_url: str = ""
 
-    def is_valid(self, min_words: int = 50) -> bool:
-        return self.word_count >= min_words and bool(self.text.strip())
+    @property
+    def url_hash(self) -> str:
+        return xxhash.xxh64(self.url).hexdigest()
 
 
 # ---------------------------------------------------------------------------
-# Extractor
+# Per-domain rate limiter
 # ---------------------------------------------------------------------------
 
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-_MULTI_SPACE    = re.compile(r"\s{2,}")
-_MULTI_NEWLINE  = re.compile(r"\n{3,}")
+class _DomainBucket:
+    """Token-bucket rate limiter for a single domain."""
+
+    def __init__(self, delay: float = 1.0):
+        self._delay = delay
+        self._last_access: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._delay - (now - self._last_access)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_access = time.monotonic()
 
 
-class ContentExtractor:
+# ---------------------------------------------------------------------------
+# Crawler
+# ---------------------------------------------------------------------------
+
+class AsyncCrawler:
     """
-    Stateless extractor — call extract(crawl_result) per page.
-    Thread-safe (no shared mutable state).
+    Async breadth-first crawler.
+
+    Usage
+    -----
+    async for result in crawler.crawl(seeds):
+        process(result)
     """
 
-    def extract(self, page: CrawlResult) -> Optional[ExtractedPage]:
-        html = page.html
-        url  = page.final_url or page.url
+    DEFAULT_HEADERS = {
+        "User-Agent": (
+            "AxonSearchBot/0.1 (+https://github.com/axon-search; "
+            "research crawler; contact: crawler@axon.search)"
+        ),
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
 
-        try:
-            text = self._extract_text(html, url)
-            if not text:
-                return None
-
-            meta   = self._extract_meta(html, url)
-            stats  = self._compute_stats(html, text)
-
-            return ExtractedPage(
-                url=url,
-                canonical_url=meta.get("canonical", url),
-                title=meta.get("title", ""),
-                text=text,
-                description=meta.get("description", ""),
-                author=meta.get("author", ""),
-                language=meta.get("language", "en"),
-                publish_date=meta.get("date", ""),
-                outlinks=meta.get("outlinks", []),
-                word_count=stats["word_count"],
-                char_count=stats["char_count"],
-                link_density=stats["link_density"],
-                avg_sentence_len=stats["avg_sentence_len"],
-            )
-        except Exception as exc:
-            logger.warning(f"Extraction failed for {url}: {exc}")
-            return None
-
-    # ------------------------------------------------------------------
-    # Text extraction cascade
-    # ------------------------------------------------------------------
-
-    def _extract_text(self, html: str, url: str) -> str:
-        # --- Attempt 1: trafilatura ---
-        text = trafilatura.extract(
-            html,
-            url=url,
-            include_comments=False,
-            include_tables=True,
-            no_fallback=False,
-            favor_precision=True,
-        )
-        if text and len(text.split()) >= 50:
-            return self._clean(text)
-
-        # --- Attempt 2: readability ---
-        try:
-            doc  = Document(html)
-            body = BeautifulSoup(doc.summary(), "lxml").get_text(separator="\n")
-            body = self._clean(body)
-            if len(body.split()) >= 50:
-                return body
-        except Exception:
-            pass
-
-        # --- Attempt 3: raw body text ---
-        soup = BeautifulSoup(html, "lxml")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
-            tag.decompose()
-        raw = soup.get_text(separator="\n")
-        return self._clean(raw)
-
-    # ------------------------------------------------------------------
-    # Metadata extraction
-    # ------------------------------------------------------------------
-
-    def _extract_meta(self, html: str, url: str) -> dict:
-        soup = BeautifulSoup(html, "lxml")
-        meta: dict = {"outlinks": []}
-
-        # Title
-        title_tag = soup.find("title")
-        og_title  = soup.find("meta", property="og:title")
-        meta["title"] = (
-            og_title["content"] if og_title and og_title.get("content")
-            else (title_tag.get_text(strip=True) if title_tag else "")
-        )
-
-        # Description
-        og_desc  = soup.find("meta", property="og:description")
-        std_desc = soup.find("meta", attrs={"name": "description"})
-        meta["description"] = (
-            og_desc["content"] if og_desc and og_desc.get("content")
-            else (std_desc["content"] if std_desc and std_desc.get("content") else "")
-        )
-
-        # Canonical
-        canonical = soup.find("link", rel="canonical")
-        meta["canonical"] = canonical["href"] if canonical and canonical.get("href") else url
-
-        # Author
-        author_meta = soup.find("meta", attrs={"name": "author"})
-        meta["author"] = author_meta["content"] if author_meta and author_meta.get("content") else ""
-
-        # Date — try common patterns
-        for selector in [
-            {"name": "article:published_time"},
-            {"property": "article:published_time"},
-            {"itemprop": "datePublished"},
-            {"name": "pubdate"},
-        ]:
-            tag = soup.find("meta", attrs=selector)
-            if tag and tag.get("content"):
-                meta["date"] = tag["content"]
-                break
-        else:
-            meta["date"] = ""
-
-        # Language
-        html_tag = soup.find("html")
-        meta["language"] = html_tag.get("lang", "en").split("-")[0] if html_tag else "en"
-
-        # Outlinks (absolute)
-        base_domain = urlparse(url).netloc
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            if href.startswith("http") and urlparse(href).netloc != base_domain:
-                meta["outlinks"].append(href)
-
-        return meta
-
-    # ------------------------------------------------------------------
-    # Stats
-    # ------------------------------------------------------------------
-
-    def _compute_stats(self, html: str, text: str) -> dict:
-        words = text.split()
-        sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()]
-        avg_sent = len(words) / max(len(sentences), 1)
-
-        # Link density: count anchor text words in raw HTML
-        soup = BeautifulSoup(html, "lxml")
-        link_words = sum(len(a.get_text().split()) for a in soup.find_all("a"))
-        density = link_words / max(len(words), 1)
-
-        return {
-            "word_count": len(words),
-            "char_count": len(text),
-            "link_density": round(density, 4),
-            "avg_sentence_len": round(avg_sent, 2),
+    def __init__(
+        self,
+        *,
+        max_depth: int = 3,
+        max_pages: int = 10_000,
+        concurrency: int = 32,
+        default_delay: float = 1.0,
+        request_timeout: float = 15.0,
+        max_response_size: int = 5 * 1024 * 1024,   # 5 MB
+        allowed_domains: list[str] | None = None,
+        disallowed_extensions: set[str] | None = None,
+    ):
+        self.max_depth = max_depth
+        self.max_pages = max_pages
+        self.concurrency = concurrency
+        self.default_delay = default_delay
+        self.request_timeout = request_timeout
+        self.max_response_size = max_response_size
+        self.allowed_domains: set[str] = set(allowed_domains or [])
+        self.disallowed_extensions: set[str] = disallowed_extensions or {
+            ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".svg",
+            ".mp4", ".mp3", ".zip", ".gz", ".tar", ".exe",
+            ".css", ".js", ".woff", ".woff2", ".ico",
         }
 
+        self._robots = RobotsCache()
+        self._buckets: dict[str, _DomainBucket] = {}
+        self._seen: Set[str] = set()
+        self._session: aiohttp.ClientSession | None = None
+
     # ------------------------------------------------------------------
-    # Cleaner
+    # Public API
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _clean(text: str) -> str:
-        text = _MULTI_SPACE.sub(" ", text)
-        text = _MULTI_NEWLINE.sub("\n\n", text)
-        return text.strip()
+    async def crawl(
+        self,
+        seeds: list[str],
+        *,
+        output_queue: asyncio.Queue | None = None,
+    ) -> AsyncIterator[CrawlResult]:
+        """
+        Async-generator that yields CrawlResult objects.
+        Also pushes to output_queue if provided (for pipeline integration).
+        """
+        frontier: asyncio.Queue[tuple[str, int, str]] = asyncio.Queue()
+        for url in seeds:
+            frontier.put_nowait((url, 0, ""))
+
+        semaphore = asyncio.Semaphore(self.concurrency)
+        pages_crawled = 0
+
+        async with aiohttp.ClientSession(
+            headers=self.DEFAULT_HEADERS,
+            connector=aiohttp.TCPConnector(limit=self.concurrency, ssl=False),
+            timeout=aiohttp.ClientTimeout(total=self.request_timeout),
+        ) as session:
+            self._session = session
+
+            pending: set[asyncio.Task] = set()
+            result_queue: asyncio.Queue[CrawlResult | None] = asyncio.Queue()
+
+            async def _worker(url: str, depth: int, parent: str) -> None:
+                async with semaphore:
+                    result = await self._fetch_one(url, depth, parent)
+                    if result:
+                        await result_queue.put(result)
+                        # Discover outlinks
+                        if depth < self.max_depth:
+                            links = self._extract_links(result.html, result.final_url or url)
+                            for link in links:
+                                h = xxhash.xxh64(link).hexdigest()
+                                if h not in self._seen:
+                                    self._seen.add(h)
+                                    frontier.put_nowait((link, depth + 1, url))
+                await result_queue.put(None)  # signal this task done
+
+            # seed
+            for url in seeds:
+                h = xxhash.xxh64(url).hexdigest()
+                self._seen.add(h)
+
+            active = 0
+
+            async def _drain_frontier() -> None:
+                nonlocal active, pages_crawled
+                while pages_crawled < self.max_pages:
+                    try:
+                        url, depth, parent = frontier.get_nowait()
+                    except asyncio.QueueEmpty:
+                        if active == 0:
+                            break
+                        await asyncio.sleep(0.05)
+                        continue
+                    task = asyncio.create_task(_worker(url, depth, parent))
+                    pending.add(task)
+                    task.add_done_callback(pending.discard)
+                    active += 1
+
+                    # collect results
+                    while not result_queue.empty():
+                        item = result_queue.get_nowait()
+                        if item is None:
+                            active -= 1
+                        else:
+                            pages_crawled += 1
+                            yield item
+                            if output_queue:
+                                await output_queue.put(item)
+
+            async for result in _drain_frontier():
+                yield result
+
+            # drain remaining
+            while active > 0 or not result_queue.empty():
+                item = await result_queue.get()
+                if item is None:
+                    active -= 1
+                else:
+                    pages_crawled += 1
+                    yield item
+                    if output_queue:
+                        await output_queue.put(item)
+
+        if output_queue:
+            await output_queue.put(None)  # sentinel
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        reraise=False,
+    )
+    async def _fetch_one(
+        self, url: str, depth: int, parent: str
+    ) -> CrawlResult | None:
+        if not self._is_allowed_url(url):
+            return None
+
+        domain = urlparse(url).netloc
+        bucket = self._buckets.setdefault(domain, _DomainBucket(self.default_delay))
+
+        # Check robots.txt
+        if not await self._robots.is_allowed(url, self._session):
+            logger.debug(f"robots.txt disallows {url}")
+            return None
+
+        await bucket.acquire()
+
+        try:
+            async with self._session.get(url, allow_redirects=True) as resp:
+                content_type = resp.content_type or ""
+                if "text/html" not in content_type:
+                    return None
+                if resp.content_length and resp.content_length > self.max_response_size:
+                    logger.debug(f"Skipping oversized page: {url}")
+                    return None
+
+                raw = await resp.content.read(self.max_response_size)
+                html = raw.decode("utf-8", errors="replace")
+                final_url = str(resp.url)
+
+                return CrawlResult(
+                    url=url,
+                    status=resp.status,
+                    html=html,
+                    content_type=content_type,
+                    final_url=final_url,
+                    depth=depth,
+                    parent_url=parent,
+                )
+        except Exception as exc:
+            logger.warning(f"Fetch failed for {url}: {exc}")
+            return None
+
+    def _is_allowed_url(self, url: str) -> bool:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        ext = "." + url.rsplit(".", 1)[-1].split("?")[0].lower() if "." in url else ""
+        if ext in self.disallowed_extensions:
+            return False
+        if self.allowed_domains and parsed.netloc not in self.allowed_domains:
+            return False
+        return True
+
+    def _extract_links(self, html: str, base_url: str) -> list[str]:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, "lxml")
+        links = []
+        for tag in soup.find_all("a", href=True):
+            href = tag["href"].strip()
+            if not href or href.startswith(("#", "javascript:", "mailto:")):
+                continue
+            abs_url = urljoin(base_url, href).split("#")[0]
+            links.append(abs_url)
+        return links
