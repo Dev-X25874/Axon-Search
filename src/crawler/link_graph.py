@@ -77,6 +77,13 @@ class LinkGraph:
             new_rank: Dict[int, float] = {}
             delta = 0.0
 
+            # dangling_sum is the same for every node — compute once per iteration
+            dangling_sum = sum(
+                rank[i] / n
+                for i in ids
+                if not self._out_edges[i]
+            )
+
             for node_id in ids:
                 in_sum = 0.0
                 for src_id in self._in_edges[node_id]:
@@ -84,20 +91,12 @@ class LinkGraph:
                     if out_count:
                         in_sum += rank[src_id] / out_count
 
-                # Handle dangling nodes (no outlinks): redistribute uniformly
-                dangling_sum = sum(
-                    rank[i] / n
-                    for i in ids
-                    if not self._out_edges[i]
-                )
-
                 new_rank[node_id] = (1 - d) / n + d * (in_sum + dangling_sum)
                 delta += abs(new_rank[node_id] - rank[node_id])
 
             rank = new_rank
             if delta < self.tol:
                 break
-
         self._scores = rank
         self._dirty  = False
 
