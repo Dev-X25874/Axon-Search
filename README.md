@@ -61,7 +61,7 @@ axon-search/
 ### 1. Install
 
 ```bash
-git clone https://github.com/yourname/axon-search
+git clone https://github.com/Dev-X25874/axon-search
 cd axon-search
 pip install -e ".[dev]"
 playwright install chromium        # only needed if you enable JS rendering
