@@ -11,6 +11,8 @@ Async web crawler.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import socket
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Set
@@ -22,6 +24,41 @@ from loguru import logger
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from .robots import RobotsCache
+
+
+def _is_private_host(host: str) -> bool:
+    """
+    True if `host` resolves to a loopback / private / link-local /
+    reserved address. Used to stop the crawler being pointed at
+    internal services (e.g. http://169.254.169.254/, http://localhost,
+    http://10.0.0.1) via a crafted seed URL or an outlink discovered on
+    a crawled page — a classic SSRF vector for any crawler that fetches
+    externally-supplied URLs.
+    """
+    try:
+        # host may already be a literal IP
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+    except ValueError:
+        pass
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        # Can't resolve — let the HTTP layer fail naturally rather than
+        # silently allowing it through.
+        return False
+
+    for info in infos:
+        ip = info[4][0]
+        try:
+            addr = ipaddress.ip_address(ip)
+        except ValueError:
+            continue
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            return True
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -140,7 +177,7 @@ class AsyncCrawler:
 
         async with aiohttp.ClientSession(
             headers=self.DEFAULT_HEADERS,
-            connector=aiohttp.TCPConnector(limit=self.concurrency, ssl=False),
+            connector=aiohttp.TCPConnector(limit=self.concurrency),
             timeout=aiohttp.ClientTimeout(total=self.request_timeout),
         ) as session:
             self._session = session
@@ -272,6 +309,10 @@ class AsyncCrawler:
         if ext in self.disallowed_extensions:
             return False
         if self.allowed_domains and parsed.netloc not in self.allowed_domains:
+            return False
+        host = parsed.hostname or ""
+        if not host or _is_private_host(host):
+            logger.warning(f"Blocked crawl of private/internal host: {url}")
             return False
         return True
 
