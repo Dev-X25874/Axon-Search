@@ -10,19 +10,19 @@ Endpoints
 GET  /health                    — liveness probe
 POST /search                    — main search
 POST /index/url                 — index a single URL on demand
-POST /index/batch               — queue a batch of seeds for crawling
+POST /index/batch                — queue a batch of seeds for crawling
 GET  /index/stats               — index statistics
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from config import get_settings
 from indexer.bm25 import BM25Index
 from indexer.embedder import Embedder
 from indexer.vector_store import VectorStore
@@ -39,28 +39,18 @@ from .routes import index as index_router
 
 
 # ---------------------------------------------------------------------------
-# Configuration (override with env vars or a config file)
-# ---------------------------------------------------------------------------
-
-INDEX_DIR     = Path("./data/index")
-EMBED_MODEL   = "BAAI/bge-large-en-v1.5"
-RERANK_MODEL  = "cross-encoder/ms-marco-MiniLM-L-12-v2"
-EMBED_DIM     = 1024    # bge-large dimension
-VECTOR_TYPE   = "hnsw"
-
-
-# ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     """Load all indices and models on startup; release on shutdown."""
+    settings = get_settings()
     logger.info("Axon Search starting up…")
 
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    bm25_path   = INDEX_DIR / "bm25.pkl"
-    vector_path = INDEX_DIR / "vectors"
+    settings.index_dir.mkdir(parents=True, exist_ok=True)
+    bm25_path   = settings.index_dir / "bm25.pkl"
+    vector_path = settings.index_dir / "vectors"
 
     # --- BM25 ---
     if bm25_path.exists():
@@ -69,13 +59,20 @@ async def _lifespan(app: FastAPI):
         bm25 = BM25Index()
 
     # --- Embedder ---
-    embedder = Embedder(EMBED_MODEL, batch_size=64)
+    embedder = Embedder(
+        settings.embed_model,
+        batch_size=settings.embed_batch_size,
+        device=settings.embed_device,
+        max_length=settings.embed_max_length,
+    )
 
     # --- VectorStore ---
     if (vector_path / "faiss.index").exists():
-        vector_store = VectorStore.load(vector_path, dim=EMBED_DIM, index_type=VECTOR_TYPE)
+        vector_store = VectorStore.load(
+            vector_path, dim=settings.embed_dim, index_type=settings.vector_index_type
+        )
     else:
-        vector_store = VectorStore(dim=EMBED_DIM, index_type=VECTOR_TYPE)
+        vector_store = VectorStore(dim=settings.embed_dim, index_type=settings.vector_index_type)
 
     # --- Link graph ---
     link_graph = LinkGraph()
@@ -87,15 +84,19 @@ async def _lifespan(app: FastAPI):
         vector_store=vector_store,
         embedder=embedder,
         link_graph=link_graph,
+        bm25_weight=settings.bm25_weight,
+        dense_weight=settings.dense_weight,
+        pagerank_alpha=settings.pagerank_alpha,
     )
-    reranker = CrossEncoderReranker(RERANK_MODEL)
-    neural_filter = NeuralFilter(embedder, threshold=0.2)
+    reranker = CrossEncoderReranker(settings.rerank_model, device=settings.rerank_device)
+    neural_filter = NeuralFilter(embedder, threshold=settings.neural_filter_threshold)
 
     # --- Indexing helpers ---
     quality = QualityScorer()
-    dedup   = DedupFilter()
+    dedup   = DedupFilter(threshold=settings.dedup_threshold, num_perm=settings.dedup_num_perm)
 
     # Store in app.state
+    app.state.settings      = settings
     app.state.bm25          = bm25
     app.state.embedder      = embedder
     app.state.vector_store  = vector_store
@@ -118,6 +119,8 @@ async def _lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
+
     app = FastAPI(
         title="Axon Search",
         description="Hybrid semantic search engine",
@@ -125,12 +128,17 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # CORS is locked down by default (no cross-origin access) unless the
+    # deployer explicitly sets CORS_ALLOW_ORIGINS. The previous default of
+    # "*" for origins/methods/headers is not safe for a service that can
+    # trigger outbound crawls and index writes.
+    if settings.cors_allow_origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=settings.cors_allow_origins,
+            allow_methods=["GET", "POST"],
+            allow_headers=["Content-Type", "Authorization"],
+        )
 
     app.include_router(search_router.router, prefix="/search", tags=["search"])
     app.include_router(index_router.router, prefix="/index",  tags=["index"])
@@ -148,11 +156,14 @@ def create_app() -> FastAPI:
 
 if __name__ == "__main__":
     import uvicorn
+
+    settings = get_settings()
     uvicorn.run(
         "api.server:create_app",
         factory=True,
-        host="0.0.0.0",
-        port=8000,
-        reload=False,
-        workers=1,
+        host=settings.api_host,
+        port=settings.api_port,
+        reload=settings.api_reload,
+        workers=settings.api_workers,
+        log_level=settings.log_level.lower(),
     )
