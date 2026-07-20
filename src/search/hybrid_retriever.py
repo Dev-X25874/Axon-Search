@@ -212,7 +212,7 @@ class HybridRetriever:
 
             # must include
             if ops.must_include and not all(
-                term.lower() in (r.title + " " + url)
+                term.lower() in (r.title.lower() + " " + url)
                 for term in ops.must_include
             ):
                 continue
