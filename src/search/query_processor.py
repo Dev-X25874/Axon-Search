@@ -74,7 +74,7 @@ _FILETYPE_RE = re.compile(r"\bfiletype:(\S+)")
 _LANG_RE     = re.compile(r"\blang:([a-z]{2})")
 _DATE_FROM   = re.compile(r"\bafter:(\d{4}-\d{2}-\d{2})")
 _DATE_TO     = re.compile(r"\bbefore:(\d{4}-\d{2}-\d{2})")
-_EXCLUDE_RE  = re.compile(r"-(\w+)")
+_EXCLUDE_RE  = re.compile(r"(?:^|\s)-(\w+)")
 _MUST_RE     = re.compile(r'\+"([^"]+)"|(\+\w+)')
 
 
