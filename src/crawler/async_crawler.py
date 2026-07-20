@@ -261,8 +261,8 @@ class AsyncCrawler:
                     parent_url=parent,
                 )
         except Exception as exc:
-            logger.warning(f"Fetch failed for {url}: {exc}")
-            return None
+            logger.warning(f"Fetch failed for {url}: {exc} — will retry")
+            raise
 
     def _is_allowed_url(self, url: str) -> bool:
         parsed = urlparse(url)
