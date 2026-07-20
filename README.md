@@ -2,18 +2,24 @@
 
 A hybrid semantic search engine.
 Combines BM25 sparse retrieval with FAISS dense retrieval, fused via Reciprocal Rank Fusion, then re-ranked with a cross-encoder.
+
+```
 query
-└─► QueryProcessor (normalise, expand, parse operators)
-└─► HybridRetriever
-├─► BM25Index (sparse, keyword precision)
-└─► VectorStore/FAISS (dense, semantic recall)
-└─► RRF Fusion + PageRank boost
-└─► NeuralFilter (bi-encoder gate)
-└─► CrossEncoderReranker
-└─► ranked results + snippets
+  └─► QueryProcessor (normalise, expand, parse operators)
+        └─► HybridRetriever
+              ├─► BM25Index (sparse, keyword precision)
+              └─► VectorStore/FAISS (dense, semantic recall)
+        └─► RRF Fusion + PageRank boost
+        └─► NeuralFilter (bi-encoder gate)
+        └─► CrossEncoderReranker
+              └─► ranked results + snippets
+```
+
 ---
 
 ## Project layout
+
+```
 axon-search/
 ├── pyproject.toml
 ├── .env.example
@@ -21,39 +27,41 @@ axon-search/
 ├── Dockerfile
 ├── docker-compose.yml
 ├── src/
-│ ├── config.py # pydantic-settings — reads .env, single source of truth
-│ ├── crawler/
-│ │ ├── async_crawler.py # async BFS + per-domain rate limiting + SSRF guard
-│ │ ├── content_extractor.py # HTML → clean text (trafilatura cascade)
-│ │ ├── link_graph.py # PageRank authority scoring
-│ │ └── robots.py # robots.txt async cache
-│ ├── indexer/
-│ │ ├── pipeline.py # streaming crawl→embed→index pipeline
-│ │ ├── embedder.py # BGE dual-encoder (sentence-transformers)
-│ │ ├── bm25.py # incremental BM25Okapi index
-│ │ └── vector_store.py # FAISS (flat / HNSW / IVF)
-│ ├── search/
-│ │ ├── query_processor.py # operator parsing, intent, WordNet expansion
-│ │ ├── hybrid_retriever.py # RRF fusion + PageRank boost
-│ │ ├── reranker.py # ms-marco cross-encoder reranker
-│ │ └── neural_filter.py # bi-encoder semantic gate
-│ ├── api/
-│ │ ├── server.py # FastAPI app factory + lifespan DI
-│ │ ├── schemas.py # Pydantic v2 request/response models
-│ │ └── routes/
-│ │ ├── search.py # POST /search
-│ │ └── index.py # POST /index/url|batch, GET /index/stats
-│ └── utils/
-│ ├── text_cleaner.py # Unicode normalise, chunk, sentence-split
-│ ├── dedup.py # MinHash LSH near-dedup (datasketch)
-│ └── quality_scorer.py # heuristic quality gate (TTR, link density…)
+│   ├── config.py                 # pydantic-settings — reads .env, single source of truth
+│   ├── crawler/
+│   │   ├── async_crawler.py      # async BFS + per-domain rate limiting + SSRF guard
+│   │   ├── content_extractor.py  # HTML → clean text (trafilatura cascade)
+│   │   ├── link_graph.py         # PageRank authority scoring
+│   │   └── robots.py             # robots.txt async cache
+│   ├── indexer/
+│   │   ├── pipeline.py           # streaming crawl→embed→index pipeline
+│   │   ├── embedder.py           # BGE dual-encoder (sentence-transformers)
+│   │   ├── bm25.py               # incremental BM25Okapi index
+│   │   └── vector_store.py       # FAISS (flat / HNSW / IVF)
+│   ├── search/
+│   │   ├── query_processor.py    # operator parsing, intent, WordNet expansion
+│   │   ├── hybrid_retriever.py   # RRF fusion + PageRank boost
+│   │   ├── reranker.py           # ms-marco cross-encoder reranker
+│   │   └── neural_filter.py      # bi-encoder semantic gate
+│   ├── api/
+│   │   ├── server.py             # FastAPI app factory + lifespan DI
+│   │   ├── schemas.py            # Pydantic v2 request/response models
+│   │   └── routes/
+│   │       ├── search.py         # POST /search
+│   │       └── index.py          # POST /index/url|batch, GET /index/stats
+│   └── utils/
+│       ├── text_cleaner.py       # Unicode normalise, chunk, sentence-split
+│       ├── dedup.py              # MinHash LSH near-dedup (datasketch)
+│       └── quality_scorer.py     # heuristic quality gate (TTR, link density…)
 └── tests/
-├── test_bm25.py
-├── test_query_processor.py
-├── test_dedup.py
-├── test_link_graph.py
-├── test_hybrid_retriever.py
-└── test_async_crawler.py
+    ├── test_bm25.py
+    ├── test_query_processor.py
+    ├── test_dedup.py
+    ├── test_link_graph.py
+    ├── test_hybrid_retriever.py
+    └── test_async_crawler.py
+```
+
 ---
 
 ## Quickstart
