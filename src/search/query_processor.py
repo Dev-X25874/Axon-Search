@@ -164,8 +164,8 @@ class QueryProcessor:
         q = query
         for pat in patterns:
             q = pat.sub("", q)
-        # Strip isolated minus signs
-        q = re.sub(r"\s-\w+", "", q)
+        # Strip exclude operators (start of string or after whitespace)
+        q = re.sub(r"(?:^|\s)-\w+", " ", q)
         return " ".join(q.split()).strip()
 
     def _detect_intent(self, tokens: list[str]) -> str:
