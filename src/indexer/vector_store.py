@@ -52,6 +52,11 @@ class VectorStore:
         self._meta: list[dict[str, Any]] = []
         self._doc_ids: list[int]         = []
 
+        # Soft-delete tombstones (doc_id, not FAISS row index). FAISS
+        # doesn't cheaply support removal for HNSW, so deletes are just
+        # filtered out of search() results, mirroring BM25Index.
+        self._deleted: set[int] = set()
+
         # Build the FAISS index
         if index_type == "flat":
             self._index = faiss.IndexFlatIP(dim)
@@ -123,7 +128,9 @@ class VectorStore:
             return []
 
         q = self._ensure_float32(query_vec).reshape(1, -1)
-        k = min(top_k, len(self))
+        # Over-fetch by the tombstone count so soft-deleted hits don't
+        # shrink the result count below top_k when avoidable.
+        k = min(top_k + len(self._deleted), len(self))
 
         scores, indices = self._index.search(q, k)
         scores  = scores[0]
@@ -134,9 +141,30 @@ class VectorStore:
             if idx < 0:   # FAISS returns -1 for empty slots
                 continue
             doc_id = self._doc_ids[idx]
+            if doc_id in self._deleted:
+                continue
             results.append((doc_id, float(score), self._meta[idx]))
+            if len(results) >= top_k:
+                break
 
         return results
+
+    # ------------------------------------------------------------------
+    # Deletion
+    # ------------------------------------------------------------------
+
+    def delete(self, doc_id: int) -> bool:
+        """Soft-delete a document by doc_id. Returns False if unknown/already deleted."""
+        if doc_id not in self._doc_ids or doc_id in self._deleted:
+            return False
+        self._deleted.add(doc_id)
+        return True
+
+    def is_deleted(self, doc_id: int) -> bool:
+        return doc_id in self._deleted
+
+    def deleted_count(self) -> int:
+        return len(self._deleted)
 
     # ------------------------------------------------------------------
     # IVF training
@@ -172,7 +200,9 @@ class VectorStore:
 
         faiss.write_index(self._index, str(directory / "faiss.index"))
         with open(directory / "meta.pkl", "wb") as f:
-            pickle.dump({"doc_ids": self._doc_ids, "meta": self._meta}, f)
+            pickle.dump(
+                {"doc_ids": self._doc_ids, "meta": self._meta, "deleted": self._deleted}, f
+            )
         logger.info(f"VectorStore saved to {directory} ({len(self)} vectors)")
 
     @classmethod
@@ -184,6 +214,7 @@ class VectorStore:
             data = pickle.load(f)
         store._doc_ids = data["doc_ids"]
         store._meta    = data["meta"]
+        store._deleted = data.get("deleted", set())  # absent in pre-delete-feature saves
         logger.info(f"VectorStore loaded from {directory} ({len(store)} vectors)")
         return store
 

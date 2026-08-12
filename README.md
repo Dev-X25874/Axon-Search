@@ -15,6 +15,11 @@ query
               └─► ranked results + snippets
 ```
 
+Also ships: soft document deletion, `/search/suggest` autocomplete,
+result-page pagination, a short-TTL search cache, optional API-key auth,
+optional rate limiting, and a Prometheus-format `/metrics` endpoint —
+see [Additional features](#additional-features) below.
+
 ---
 
 ## Project layout
@@ -46,20 +51,27 @@ axon-search/
 │   ├── api/
 │   │   ├── server.py             # FastAPI app factory + lifespan DI
 │   │   ├── schemas.py            # Pydantic v2 request/response models
+│   │   ├── auth.py               # optional X-API-Key middleware
+│   │   ├── rate_limit.py         # optional per-client rate limiting
+│   │   ├── metrics.py            # /metrics — Prometheus-format counters
 │   │   └── routes/
-│   │       ├── search.py         # POST /search
-│   │       └── index.py          # POST /index/url|batch, GET /index/stats
+│   │       ├── search.py         # POST /search, GET /search/suggest
+│   │       └── index.py          # POST /index/url|batch, DELETE /index/url,
+│   │                             # GET /index/stats, GET /index/jobs[/{id}]
 │   └── utils/
 │       ├── text_cleaner.py       # Unicode normalise, chunk, sentence-split
 │       ├── dedup.py              # MinHash LSH near-dedup (datasketch)
-│       └── quality_scorer.py     # heuristic quality gate (TTR, link density…)
+│       ├── quality_scorer.py     # heuristic quality gate (TTR, link density…)
+│       └── cache.py              # TTL+LRU cache backing the search cache
 └── tests/
     ├── test_bm25.py
+    ├── test_vector_store.py
     ├── test_query_processor.py
     ├── test_dedup.py
     ├── test_link_graph.py
     ├── test_hybrid_retriever.py
-    └── test_async_crawler.py
+    ├── test_async_crawler.py
+    └── test_api.py
 ```
 
 ---
@@ -137,16 +149,24 @@ pip install -e ".[dev]"
 pytest
 ```
 
-48 tests covering `BM25Index`, `QueryProcessor`, `DedupFilter`, `LinkGraph`/PageRank,
-`HybridRetriever` (RRF fusion, filters, PageRank boost — via fakes, no real ML models
-required), and `AsyncCrawler`'s URL allow-listing and SSRF guard.
+90 tests covering `BM25Index` (incl. soft-delete and `suggest()`), `VectorStore`
+(incl. soft-delete), `QueryProcessor`, `DedupFilter`, `LinkGraph`/PageRank,
+`HybridRetriever` (RRF fusion, filters, PageRank boost — via fakes, no real ML
+models required), `AsyncCrawler`'s URL allow-listing and SSRF guard, and the
+API layer (`test_api.py` — search, suggest, delete, jobs, stats, `/metrics`,
+auth, and rate-limiting, all via fakes).
 
 `HybridRetriever`'s test module imports through the real `sentence-transformers` /
 `torch` / `faiss` stack (same as the app does), so a full `pip install -e ".[dev]"`
 is needed for that file specifically; the rest run with just `pytest` + the
-lighter-weight deps.
+lighter-weight deps. `test_api.py` also avoids the real `sentence_transformers`
+import when it isn't installed by falling back to a stub package under
+`tests/_stubs/` (see `tests/conftest.py`) — a real install always takes priority.
 
-There's no CI workflow configured — tests are run manually / locally for now.
+## CI
+
+`.github/workflows/tests.yml` runs `ruff check` and the full `pytest` suite
+(with coverage) on push/PR across Python 3.10–3.12.
 
 ---
 
@@ -160,6 +180,30 @@ The compose file starts the API on port 8000 and mounts `./data` for index persi
 
 ---
 
+---
+
+## Additional features
+
+Beyond the core hybrid-search pipeline, the API also ships:
+
+- **Document deletion** — `DELETE /index/url` soft-deletes a document; it
+  disappears from `/search` immediately.
+- **Autocomplete** — `GET /search/suggest?q=` completes a prefix against
+  indexed vocabulary.
+- **Pagination** — `offset` on `POST /search` pages through results without
+  re-scoring from rank 0.
+- **Search caching** — short-TTL cache for repeated identical queries
+  (`SEARCH_CACHE_TTL_S`), auto-invalidated on delete/reindex.
+- **Optional API-key auth** and **optional rate limiting**, both opt-in via
+  env vars (see [Security notes](#security-notes)).
+- **`GET /metrics`** — Prometheus-format request counters and latency.
+- **`GET /index/jobs`** — list/filter background crawl jobs, not just look
+  one up by id.
+
+Full parameters for each are in [API reference](#api-reference) below.
+
+---
+
 ## API reference
 
 ### `POST /search`
@@ -168,9 +212,15 @@ The compose file starts the API on port 8000 and mounts `./data` for index persi
 |---|---|---|---|
 | `query` | string | required | Raw search query |
 | `top_k` | int | 10 | Results to return (max 100) |
+| `offset` | int | 0 | Results to skip before `top_k` (pagination, max 10,000) |
 | `rerank` | bool | true | Apply cross-encoder reranker |
 | `neural_filter` | bool | true | Apply bi-encoder semantic gate |
 | `filters` | object | {} | Metadata equality filters |
+
+Response includes a `cached: bool` field — `true` when served from the
+short-TTL search cache (`SEARCH_CACHE_TTL_S`) instead of re-running
+retrieval/reranking. The cache is cleared automatically whenever
+`/index/url` (DELETE) removes a document or a batch job finishes indexing.
 
 **Supported query operators**
 
@@ -183,12 +233,38 @@ The compose file starts the API on port 8000 and mounts `./data` for index persi
 | `after:` | `after:2024-01-01` | Published after date |
 | `before:` | `before:2025-01-01` | Published before date |
 
+### `GET /search/suggest`
+
+Autocomplete over indexed vocabulary, ranked by document frequency.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `q` | string | required | Prefix to complete |
+| `limit` | int | 10 | Max suggestions (max 50) |
+
+```bash
+curl "http://localhost:8000/search/suggest?q=atten&limit=5"
+```
+
 ### `POST /index/url`
 
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `url` | string | required | URL to crawl and index |
 | `depth` | int | 0 | Crawl depth from this URL |
+
+### `DELETE /index/url`
+
+Soft-deletes a previously indexed URL — it's immediately excluded from
+`/search` results (and the search cache is cleared), without a full
+index rebuild. The row stays on disk as a tombstone until you rebuild
+the index from scratch.
+
+```bash
+curl -X DELETE "http://localhost:8000/index/url?url=https://arxiv.org/abs/2005.14165"
+```
+
+Returns `404` if the URL was never indexed.
 
 ### `POST /index/batch`
 
@@ -199,9 +275,35 @@ The compose file starts the API on port 8000 and mounts `./data` for index persi
 | `max_depth` | int | 3 | Crawl depth |
 | `concurrency` | int | 16 | Concurrent fetches |
 
+### `GET /index/jobs`
+
+Lists background jobs, most recent first.
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `limit` | int | 50 | Max jobs returned (max 500) |
+| `status` | string | *(unset)* | Filter: `pending` / `running` / `done` / `failed` |
+
+### `GET /index/jobs/{job_id}`
+
+Status of a single job (also returned synchronously by `/index/url` and
+`/index/batch`).
+
 ### `GET /index/stats`
 
-Returns `{ bm25_docs, vector_docs, graph_nodes, graph_edges }`.
+Returns `{ bm25_docs, vector_docs, graph_nodes, graph_edges, bm25_deleted, vector_deleted }`.
+`bm25_docs`/`vector_docs` already exclude soft-deleted documents;
+`*_deleted` is the tombstone count.
+
+### `GET /metrics`
+
+Prometheus text-format request counters and cumulative latency per
+route, plus process uptime. Always reachable, even when
+`API_KEYS`/rate limiting are enabled, so scrapers don't need a key.
+
+### `GET /health`
+
+Liveness probe — `{ "status": "ok" }`. Always reachable, same as `/metrics`.
 
 ---
 
@@ -222,6 +324,11 @@ variables or a `.env` file (see `.env.example`).
 | `DEDUP_THRESHOLD` | `0.8` | Jaccard threshold for near-dedup |
 | `NEURAL_FILTER_THRESHOLD` | `0.25` | Minimum bi-encoder similarity |
 | `CORS_ALLOW_ORIGINS` | *(unset)* | Comma-separated allowed origins. Unset = CORS disabled entirely (no cross-origin access), not `*`. |
+| `API_KEYS` | *(unset)* | Comma-separated API keys. Unset = auth disabled. Clients send `X-API-Key`. |
+| `RATE_LIMIT_PER_MINUTE` | `0` | Max requests per client (per key, else per IP) per rolling 60s. `0` = disabled. |
+| `SEARCH_CACHE_TTL_S` | `30.0` | TTL for cached `/search` responses. `0` disables caching. |
+| `SEARCH_CACHE_SIZE` | `512` | Max cached search responses (LRU eviction). |
+| `SUGGEST_MAX_RESULTS` | `10` | Default `limit` for `/search/suggest`. |
 
 ---
 
@@ -236,13 +343,26 @@ variables or a `.env` file (see `.env.example`).
   resolve to loopback, private (RFC1918), link-local (including the
   `169.254.169.254` cloud metadata endpoint), or otherwise reserved addresses
   are rejected before any request is made.
-- **No authentication is implemented on any endpoint**, including
-  `/index/url` and `/index/batch`, which can trigger outbound crawls. Do not
-  expose this service directly to the public internet without adding an auth
-  layer (reverse proxy, API key middleware, etc.) in front of it.
-- **The `/index/jobs` registry is in-memory** and unauthenticated — anyone who
-  can reach the API can read job status. Fine for local/dev use; replace with
-  a real store + access control before running multi-tenant.
+- **Authentication is opt-in via `API_KEYS`.** Unset (the dev default) means
+  no auth, same as before — set it before exposing `/index/url` and
+  `/index/batch` (which trigger outbound crawls) beyond localhost. Clients
+  authenticate with a static `X-API-Key` header; `/health` and `/metrics`
+  stay reachable without a key so orchestrators/scrapers keep working.
+  This is intentionally simple (static shared keys, no rotation/scoping) —
+  put a real auth layer (OAuth2, reverse-proxy SSO, etc.) in front for
+  multi-tenant or production use.
+- **Rate limiting is opt-in via `RATE_LIMIT_PER_MINUTE`.** The limiter is
+  in-memory and per-process — fine for `API_WORKERS=1`, but counts aren't
+  shared across workers/replicas, so it under-limits if you scale out.
+  Use a Redis-backed limiter at that point.
+- **The `/index/jobs` registry is in-memory** and — unless `API_KEYS` is
+  set — unauthenticated: anyone who can reach the API can read job status.
+  Fine for local/dev use; replace with a real store + access control before
+  running multi-tenant.
+- **The search cache has no cross-request access control.** If you enable
+  `API_KEYS`, results are still cached and served across different callers'
+  identical queries (no per-key partitioning). Set `SEARCH_CACHE_TTL_S=0`
+  if that's not acceptable for your deployment.
 
 ---
 

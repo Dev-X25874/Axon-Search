@@ -78,6 +78,28 @@ class Settings(BaseSettings):
     # Defaults to no cross-origin access rather than "*" — tighten/loosen per deployment.
     cors_allow_origins: list[str] = []
 
+    # ── Auth ─────────────────────────────────────────────────────────
+    # Comma-separated API keys. Empty (default) = auth disabled, matching
+    # the CORS pattern above — opt in per deployment via API_KEYS.
+    # Callers send the key in the `X-API-Key` header. /health and /metrics
+    # stay open even when auth is enabled, so orchestrators can probe them.
+    api_keys: list[str] = []
+
+    # ── Rate limiting ────────────────────────────────────────────────
+    # Requests allowed per client (per API key if present, else per IP)
+    # in a rolling 60s window. 0 (default) disables rate limiting.
+    rate_limit_per_minute: int = 0
+
+    # ── Search result cache ─────────────────────────────────────────
+    # Short-TTL in-memory cache for identical /search requests. This is
+    # a process-local cache with no invalidation on index writes, so keep
+    # the TTL short relative to how often the index changes. 0 disables it.
+    search_cache_ttl_s: float = 30.0
+    search_cache_size: int = 512
+
+    # ── Autocomplete ─────────────────────────────────────────────────
+    suggest_max_results: int = 10
+
 
 @lru_cache
 def get_settings() -> Settings:

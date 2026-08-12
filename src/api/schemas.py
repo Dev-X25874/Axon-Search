@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator
 class SearchRequest(BaseModel):
     query:      str = Field(..., min_length=1, max_length=1024, description="Search query")
     top_k:      int = Field(10, ge=1, le=100, description="Number of results to return")
+    offset:     int = Field(0, ge=0, le=10_000, description="Number of results to skip (pagination)")
     rerank:     bool = Field(True, description="Apply cross-encoder reranking")
     neural_filter: bool = Field(True, description="Apply neural relevance filter")
     filters:    dict[str, Any] = Field(default_factory=dict, description="Metadata filters")
@@ -45,6 +46,12 @@ class SearchResponse(BaseModel):
     results:        list[ResultItem]
     total_retrieved: int
     elapsed_ms:     float
+    cached:         bool = Field(False, description="True if served from the search cache")
+
+
+class SuggestResponse(BaseModel):
+    query:       str
+    suggestions: list[str]
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +77,7 @@ class IndexJobStatus(BaseModel):
     indexed:   int   = 0
     elapsed_s: float = 0.0
     error:     Optional[str] = None
+    created_at: float = 0.0
 
 
 class IndexStatsResponse(BaseModel):
@@ -77,3 +85,11 @@ class IndexStatsResponse(BaseModel):
     vector_docs:  int
     graph_nodes:  int
     graph_edges:  int
+    bm25_deleted:   int = 0
+    vector_deleted: int = 0
+
+
+class DeleteURLResponse(BaseModel):
+    deleted: bool
+    url:     str
+    doc_id:  Optional[int] = None

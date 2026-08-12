@@ -1,5 +1,6 @@
 """
-POST /search — main search endpoint.
+POST /search          — main search endpoint.
+GET  /search/suggest   — lightweight autocomplete over indexed vocabulary.
 
 Pipeline
 --------
@@ -10,17 +11,30 @@ Pipeline
 5. CrossEncoderReranker.rerank() (optional)
 6. Snippet generation
 7. Serialize SearchResponse
+
+Caching
+-------
+Identical requests (same query/top_k/offset/rerank/neural_filter/filters)
+within SEARCH_CACHE_TTL_S are served from an in-memory TTL cache instead
+of re-running retrieval/reranking. Disabled by setting the TTL to 0.
+
+Pagination
+----------
+`offset` skips the first N fused/reranked results before applying
+`top_k`, so callers can page through results without re-scoring
+everything from rank 0 each time.
 """
 
 from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Query, Request
 from loguru import logger
 
-from api.schemas import SearchRequest, SearchResponse, ResultItem
+from api.schemas import SearchRequest, SearchResponse, ResultItem, SuggestResponse
 from search.reranker import CrossEncoderReranker
+from utils.cache import make_key
 
 router = APIRouter()
 
@@ -35,23 +49,36 @@ async def search(req: SearchRequest, request: Request) -> SearchResponse:
     reranker    = state.reranker
     n_filter    = state.neural_filter
     bm25        = state.bm25
+    cache       = getattr(state, "search_cache", None)
+
+    cache_key = make_key(
+        req.query, req.top_k, req.offset, req.rerank, req.neural_filter, req.filters
+    )
+    if cache is not None:
+        cached_response = cache.get(cache_key)
+        if cached_response is not None:
+            elapsed = round((time.perf_counter() - t0) * 1000, 2)
+            return cached_response.model_copy(update={"cached": True, "elapsed_ms": elapsed})
+
+    window = req.offset + req.top_k
 
     # 1. Process query
     pq = query_proc.process(req.query)
     logger.info(
         f"Search | query={req.query!r} intent={pq.intent} "
-        f"operators={pq.operators}"
+        f"operators={pq.operators} offset={req.offset}"
     )
 
-    # 2. Retrieve
+    # 2. Retrieve (over-fetch enough candidates to cover offset + top_k,
+    #    plus reranking headroom)
     candidates = retriever.retrieve(
         pq,
-        top_k=req.top_k * 5 if req.rerank else req.top_k,
+        top_k=window * 5 if req.rerank else window,
         filters=req.filters or None,
     )
 
     if not candidates:
-        return SearchResponse(
+        response = SearchResponse(
             query=req.query,
             intent=pq.intent,
             expanded_query=pq.expanded,
@@ -59,6 +86,9 @@ async def search(req: SearchRequest, request: Request) -> SearchResponse:
             total_retrieved=0,
             elapsed_ms=round((time.perf_counter() - t0) * 1000, 2),
         )
+        if cache is not None:
+            cache.set(cache_key, response)
+        return response
 
     total_retrieved = len(candidates)
 
@@ -72,16 +102,19 @@ async def search(req: SearchRequest, request: Request) -> SearchResponse:
     if req.neural_filter:
         candidates = n_filter.filter(req.query, candidates, text_map=text_map)
 
-    # 4. Rerank
+    # 4. Rerank (score/sort the full window, then apply offset below)
     if req.rerank and candidates:
         candidates = reranker.rerank(
             pq.normalised,
             candidates,
             text_map=text_map,
-            top_k=req.top_k,
+            top_k=window,
         )
     else:
-        candidates = candidates[:req.top_k]
+        candidates = candidates[:window]
+
+    # 4b. Pagination — skip the first `offset` results
+    candidates = candidates[req.offset:req.offset + req.top_k]
 
     # 5. Snippets
     for r in candidates:
@@ -111,7 +144,7 @@ async def search(req: SearchRequest, request: Request) -> SearchResponse:
     elapsed = round((time.perf_counter() - t0) * 1000, 2)
     logger.info(f"Search complete | results={len(items)} elapsed={elapsed}ms")
 
-    return SearchResponse(
+    response = SearchResponse(
         query=req.query,
         intent=pq.intent,
         expanded_query=pq.expanded,
@@ -119,3 +152,17 @@ async def search(req: SearchRequest, request: Request) -> SearchResponse:
         total_retrieved=total_retrieved,
         elapsed_ms=elapsed,
     )
+    if cache is not None:
+        cache.set(cache_key, response)
+    return response
+
+
+@router.get("/suggest", response_model=SuggestResponse)
+async def suggest(
+    request: Request,
+    q: str = Query(..., min_length=1, max_length=100, description="Prefix to autocomplete"),
+    limit: int = Query(10, ge=1, le=50),
+) -> SuggestResponse:
+    """Autocomplete indexed vocabulary by prefix, ranked by document frequency."""
+    bm25 = request.app.state.bm25
+    return SuggestResponse(query=q, suggestions=bm25.suggest(q, limit=limit))

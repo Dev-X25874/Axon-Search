@@ -69,6 +69,20 @@ class BM25Index:
         self._bm25: BM25Okapi | None            = None
         self._dirty = False
 
+        # Soft-delete tombstones: BM25Okapi has no native removal, and
+        # rebuilding FAISS/BM25 on every delete is expensive, so deleted
+        # doc_ids are just filtered out of search() results.
+        self._deleted: set[int] = set()
+
+        # url -> doc_id, populated from add()'s metadata when present.
+        # Lets callers delete/look up a document by URL instead of doc_id.
+        self._url_to_id: dict[str, int] = {}
+
+        # Raw (unstemmed) word frequencies, for autocomplete. Kept
+        # separate from the stemmed tokens used for BM25 scoring since
+        # stemmed prefixes ("attent") make poor suggestions.
+        self._vocab_freq: dict[str, int] = {}
+
     # ------------------------------------------------------------------
     # Building the index
     # ------------------------------------------------------------------
@@ -82,6 +96,13 @@ class BM25Index:
         self._tokenized_corpus.append(_tokenize(text))
         self._metadata.append(metadata or {})
         self._dirty = True
+
+        meta = metadata or {}
+        url = meta.get("url")
+        if url:
+            self._url_to_id[url] = doc_id
+
+        self._update_vocab(text)
         return doc_id
 
     def add_batch(self, texts: list[str], metadata: list[dict] | None = None) -> list[int]:
@@ -90,6 +111,13 @@ class BM25Index:
         for text, m in zip(texts, meta):
             ids.append(self.add(text, m))
         return ids
+
+    def _update_vocab(self, text: str) -> None:
+        """Track raw lowercase word frequencies for suggest()."""
+        words = _MULTI_WS.sub(" ", text.lower().translate(_PUNCT)).split()
+        for w in words:
+            if w not in _STOP_WORDS and len(w) > 1:
+                self._vocab_freq[w] = self._vocab_freq.get(w, 0) + 1
 
     def _rebuild(self) -> None:
         if not self._tokenized_corpus:
@@ -127,16 +155,23 @@ class BM25Index:
 
         scores = self._bm25.get_scores(tokens)
 
-        # Partial sort: get top_k indices without full sort
+        # Partial sort: get top_k indices without full sort. Over-fetch by
+        # the number of tombstoned docs so deleted hits don't shrink the
+        # result count below top_k when possible.
         import numpy as np
-        idx = np.argpartition(scores, -min(top_k, len(scores)))[-top_k:]
+        fetch_k = min(top_k + len(self._deleted), len(scores))
+        idx = np.argpartition(scores, -fetch_k)[-fetch_k:]
         idx = idx[np.argsort(scores[idx])[::-1]]
 
-        return [
-            (int(i), float(scores[i]), self._metadata[i])
-            for i in idx
-            if scores[i] > 0
-        ]
+        results = []
+        for i in idx:
+            doc_id = int(i)
+            if doc_id in self._deleted or scores[i] <= 0:
+                continue
+            results.append((doc_id, float(scores[i]), self._metadata[doc_id]))
+            if len(results) >= top_k:
+                break
+        return results
 
     def get_metadata(self, doc_id: int) -> dict:
         if 0 <= doc_id < len(self._metadata):
@@ -144,7 +179,56 @@ class BM25Index:
         return {}
 
     def __len__(self) -> int:
-        return len(self._tokenized_corpus)
+        return len(self._tokenized_corpus) - len(self._deleted)
+
+    # ------------------------------------------------------------------
+    # Deletion
+    # ------------------------------------------------------------------
+
+    def delete(self, doc_id: int) -> bool:
+        """Soft-delete a document by doc_id. Returns False if unknown/already deleted."""
+        if not (0 <= doc_id < len(self._tokenized_corpus)) or doc_id in self._deleted:
+            return False
+        self._deleted.add(doc_id)
+        return True
+
+    def delete_by_url(self, url: str) -> bool:
+        """Soft-delete the document indexed under this URL, if any."""
+        doc_id = self._url_to_id.get(url)
+        if doc_id is None:
+            return False
+        return self.delete(doc_id)
+
+    def url_to_doc_id(self, url: str) -> int | None:
+        return self._url_to_id.get(url)
+
+    def is_deleted(self, doc_id: int) -> bool:
+        return doc_id in self._deleted
+
+    def deleted_count(self) -> int:
+        return len(self._deleted)
+
+    # ------------------------------------------------------------------
+    # Autocomplete
+    # ------------------------------------------------------------------
+
+    def suggest(self, prefix: str, limit: int = 10) -> list[str]:
+        """
+        Return up to `limit` indexed words starting with `prefix`,
+        ranked by frequency across the corpus.
+
+        Uses raw (unstemmed) words, so results read naturally as
+        autocomplete suggestions rather than BM25's internal stems.
+        """
+        prefix = prefix.strip().lower()
+        if not prefix:
+            return []
+        matches = [
+            (word, freq) for word, freq in self._vocab_freq.items()
+            if word.startswith(prefix)
+        ]
+        matches.sort(key=lambda pair: (-pair[1], pair[0]))
+        return [word for word, _freq in matches[:limit]]
 
     # ------------------------------------------------------------------
     # Persistence
@@ -160,6 +244,9 @@ class BM25Index:
                     "metadata": self._metadata,
                     "k1": self.k1,
                     "b":  self.b,
+                    "deleted":    self._deleted,
+                    "url_to_id":  self._url_to_id,
+                    "vocab_freq": self._vocab_freq,
                 },
                 f,
                 protocol=pickle.HIGHEST_PROTOCOL,
@@ -173,6 +260,11 @@ class BM25Index:
         idx = cls(k1=data["k1"], b=data["b"])
         idx._tokenized_corpus = data["corpus"]
         idx._metadata         = data["metadata"]
+        # New fields are absent in indices pickled before this feature —
+        # default to empty rather than failing to load old data.
+        idx._deleted     = data.get("deleted", set())
+        idx._url_to_id   = data.get("url_to_id", {})
+        idx._vocab_freq  = data.get("vocab_freq", {})
         idx._dirty = True   # will rebuild on next search
         logger.info(f"BM25 index loaded from {path} ({len(idx)} docs)")
         return idx

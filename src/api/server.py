@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 from loguru import logger
 
 from config import get_settings
@@ -31,9 +32,13 @@ from search.query_processor import QueryProcessor
 from search.hybrid_retriever import HybridRetriever
 from search.reranker import CrossEncoderReranker
 from search.neural_filter import NeuralFilter
+from utils.cache import TTLCache
 from utils.dedup import DedupFilter
 from utils.quality_scorer import QualityScorer
 
+from .auth import APIKeyMiddleware
+from .metrics import MetricsMiddleware, metrics
+from .rate_limit import RateLimitMiddleware
 from .routes import search as search_router
 from .routes import index as index_router
 
@@ -95,6 +100,9 @@ async def _lifespan(app: FastAPI):
     quality = QualityScorer()
     dedup   = DedupFilter(threshold=settings.dedup_threshold, num_perm=settings.dedup_num_perm)
 
+    # --- Search result cache (TTL disabled entirely when ttl <= 0) ---
+    search_cache = TTLCache(maxsize=settings.search_cache_size, ttl=settings.search_cache_ttl_s)
+
     # Store in app.state
     app.state.settings      = settings
     app.state.bm25          = bm25
@@ -107,6 +115,7 @@ async def _lifespan(app: FastAPI):
     app.state.neural_filter = neural_filter
     app.state.quality       = quality
     app.state.dedup         = dedup
+    app.state.search_cache  = search_cache
 
     logger.info("Axon Search ready")
     yield
@@ -140,12 +149,29 @@ def create_app() -> FastAPI:
             allow_headers=["Content-Type", "Authorization"],
         )
 
+    # Middleware order (Starlette applies the *last-added* one outermost):
+    # metrics wraps everything (times auth/rate-limit rejections too),
+    # rate-limit runs before auth so a flood of bad keys still gets 429'd
+    # cheaply, auth runs innermost, closest to the route handlers.
+    #
+    # All three are opt-in / no-ops by default:
+    #   - APIKeyMiddleware:   no-op when API_KEYS is unset (dev default)
+    #   - RateLimitMiddleware: no-op when RATE_LIMIT_PER_MINUTE=0 (default)
+    #   - MetricsMiddleware:  always on, negligible overhead (in-memory counters)
+    app.add_middleware(APIKeyMiddleware, api_keys=settings.api_keys)
+    app.add_middleware(RateLimitMiddleware, requests_per_minute=settings.rate_limit_per_minute)
+    app.add_middleware(MetricsMiddleware, registry=metrics)
+
     app.include_router(search_router.router, prefix="/search", tags=["search"])
     app.include_router(index_router.router, prefix="/index",  tags=["index"])
 
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.get("/metrics", response_class=PlainTextResponse)
+    async def get_metrics():
+        return metrics.render_prometheus()
 
     return app
 
