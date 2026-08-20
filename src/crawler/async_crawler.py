@@ -187,7 +187,17 @@ class AsyncCrawler:
 
             async def _worker(url: str, depth: int, parent: str) -> None:
                 async with semaphore:
-                    result = await self._fetch_one(url, depth, parent)
+                    try:
+                        result = await self._fetch_one(url, depth, parent)
+                    except Exception as exc:
+                        # _fetch_one is wrapped in @retry(reraise=False); once all
+                        # attempts are exhausted it raises RetryError here. If we
+                        # don't catch it, this task never reaches the
+                        # `result_queue.put(None)` sentinel below, `active` never
+                        # decrements in _drain_frontier, and the crawl hangs forever
+                        # waiting for a task that already died.
+                        logger.warning(f"Giving up on {url} after retries: {exc}")
+                        result = None
                     if result:
                         await result_queue.put(result)
                         # Discover outlinks
@@ -327,3 +337,4 @@ class AsyncCrawler:
             abs_url = urljoin(base_url, href).split("#")[0]
             links.append(abs_url)
         return links
+        
