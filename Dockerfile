@@ -21,11 +21,12 @@ FROM python:3.11-slim AS runtime
 
 WORKDIR /app
 
-# Runtime system libs
+# Runtime system libs (curl is required by the HEALTHCHECK below)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libxml2 \
     libxslt1.1 \
     libgomp1 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
