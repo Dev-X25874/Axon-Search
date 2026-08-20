@@ -1,4 +1,4 @@
-.PHONY: install dev server index-url index-batch search lint fmt typecheck clean
+.PHONY: install server index-url index-batch search stats health lint fmt typecheck docker-build docker-up docker-down clean clean-all
 
 # ── Setup ──────────────────────────────────────────────────────────────────
 
