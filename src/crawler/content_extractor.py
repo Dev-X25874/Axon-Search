@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 from urllib.parse import urlparse
 
 import trafilatura
@@ -64,7 +63,7 @@ class ContentExtractor:
     Thread-safe (no shared mutable state).
     """
 
-    def extract(self, page: CrawlResult) -> Optional[ExtractedPage]:
+    def extract(self, page: CrawlResult) -> ExtractedPage | None:
         html = page.html
         url  = page.final_url or page.url
 

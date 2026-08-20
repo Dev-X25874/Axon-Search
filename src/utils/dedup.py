@@ -15,7 +15,6 @@ Shingles are character-level 5-grams (robust to tokenisation differences).
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from datasketch import MinHash, MinHashLSH
 from loguru import logger

@@ -32,7 +32,7 @@ import time
 from fastapi import APIRouter, Query, Request
 from loguru import logger
 
-from api.schemas import SearchRequest, SearchResponse, ResultItem, SuggestResponse
+from api.schemas import ResultItem, SearchRequest, SearchResponse, SuggestResponse
 from search.reranker import CrossEncoderReranker
 from utils.cache import make_key
 

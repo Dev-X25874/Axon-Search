@@ -22,10 +22,9 @@ from api.routes import index as index_router
 from api.routes import search as search_router
 from indexer.bm25 import BM25Index
 from indexer.vector_store import VectorStore
-from search.hybrid_retriever import HybridRetriever, SearchResult
+from search.hybrid_retriever import HybridRetriever
 from search.query_processor import QueryProcessor
 from utils.cache import TTLCache
-
 
 # ---------------------------------------------------------------------------
 # Fakes

@@ -4,9 +4,9 @@ Pydantic v2 request / response schemas for the Axon Search API.
 
 from __future__ import annotations
 
-from typing import Any, Optional
-from pydantic import BaseModel, Field, HttpUrl, field_validator
+from typing import Any
 
+from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 # ---------------------------------------------------------------------------
 # Search
@@ -32,11 +32,11 @@ class ResultItem(BaseModel):
     snippet:        str
     score:          float
     rrf_score:      float
-    rerank_score:   Optional[float] = None
+    rerank_score:   float | None = None
     pagerank:       float           = 0.0
-    bm25_rank:      Optional[int]   = None
-    dense_rank:     Optional[int]   = None
-    neural_sim:     Optional[float] = None
+    bm25_rank:      int | None   = None
+    dense_rank:     int | None   = None
+    neural_sim:     float | None = None
 
 
 class SearchResponse(BaseModel):
@@ -76,7 +76,7 @@ class IndexJobStatus(BaseModel):
     crawled:   int   = 0
     indexed:   int   = 0
     elapsed_s: float = 0.0
-    error:     Optional[str] = None
+    error:     str | None = None
     created_at: float = 0.0
 
 
@@ -92,4 +92,4 @@ class IndexStatsResponse(BaseModel):
 class DeleteURLResponse(BaseModel):
     deleted: bool
     url:     str
-    doc_id:  Optional[int] = None
+    doc_id:  int | None = None

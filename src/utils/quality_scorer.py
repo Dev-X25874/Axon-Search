@@ -24,7 +24,6 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -90,7 +89,7 @@ class QualityScorer:
         self,
         text: str,
         *,
-        word_count: Optional[int]  = None,
+        word_count: int | None  = None,
         link_density: float        = 0.0,
         avg_sentence_len: float    = 0.0,
     ) -> float:
@@ -111,7 +110,7 @@ class QualityScorer:
         signals.append((wc_score, 2.0))
 
         # Type-token ratio (vocabulary richness)
-        ttr = len(set(w.lower() for w in words)) / max(wc, 1)
+        ttr = len({w.lower() for w in words}) / max(wc, 1)
         ttr_score = min(ttr * 2.0, 1.0)   # 0.5 TTR → 1.0
         signals.append((ttr_score, 1.5))
 
@@ -156,7 +155,7 @@ class QualityScorer:
         score = self.score(page)
         words = page.text.split()
         wc    = len(words)
-        ttr   = len(set(w.lower() for w in words)) / max(wc, 1)
+        ttr   = len({w.lower() for w in words}) / max(wc, 1)
         digits = sum(1 for c in page.text if c.isdigit())
         uppers = sum(1 for c in page.text if c.isupper())
         return QualityReport(

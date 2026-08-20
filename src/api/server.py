@@ -24,14 +24,14 @@ from fastapi.responses import PlainTextResponse
 from loguru import logger
 
 from config import get_settings
+from crawler.link_graph import LinkGraph
 from indexer.bm25 import BM25Index
 from indexer.embedder import Embedder
 from indexer.vector_store import VectorStore
-from crawler.link_graph import LinkGraph
-from search.query_processor import QueryProcessor
 from search.hybrid_retriever import HybridRetriever
-from search.reranker import CrossEncoderReranker
 from search.neural_filter import NeuralFilter
+from search.query_processor import QueryProcessor
+from search.reranker import CrossEncoderReranker
 from utils.cache import TTLCache
 from utils.dedup import DedupFilter
 from utils.quality_scorer import QualityScorer
@@ -39,9 +39,8 @@ from utils.quality_scorer import QualityScorer
 from .auth import APIKeyMiddleware
 from .metrics import MetricsMiddleware, metrics
 from .rate_limit import RateLimitMiddleware
-from .routes import search as search_router
 from .routes import index as index_router
-
+from .routes import search as search_router
 
 # ---------------------------------------------------------------------------
 # App factory

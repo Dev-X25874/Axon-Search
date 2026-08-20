@@ -19,7 +19,6 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 from loguru import logger
@@ -29,8 +28,9 @@ from crawler.content_extractor import ContentExtractor, ExtractedPage
 from crawler.link_graph import LinkGraph
 from utils.dedup import DedupFilter
 from utils.quality_scorer import QualityScorer
-from .embedder import Embedder
+
 from .bm25 import BM25Index
+from .embedder import Embedder
 from .vector_store import VectorStore
 
 
@@ -102,8 +102,8 @@ class IndexPipeline:
         t0    = time.monotonic()
 
         # Inter-stage queues
-        crawl_q:   asyncio.Queue[Optional[CrawlResult]]  = asyncio.Queue(maxsize=256)
-        extract_q: asyncio.Queue[Optional[ExtractedPage]] = asyncio.Queue(maxsize=256)
+        crawl_q:   asyncio.Queue[CrawlResult | None]  = asyncio.Queue(maxsize=256)
+        extract_q: asyncio.Queue[ExtractedPage | None] = asyncio.Queue(maxsize=256)
 
         # Run stages concurrently
         await asyncio.gather(
@@ -191,7 +191,7 @@ class IndexPipeline:
             if not pages:
                 return
             texts = [p.text for p in pages]
-            urls  = [p.url  for p in pages]
+            [p.url  for p in pages]
 
             # Embed (CPU/GPU blocking call → run in executor)
             vectors: np.ndarray = await loop.run_in_executor(

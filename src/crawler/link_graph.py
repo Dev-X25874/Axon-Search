@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from typing import Dict, List, Optional
 
 
 class LinkGraph:
@@ -28,11 +27,11 @@ class LinkGraph:
         self.iterations = iterations
         self.tol        = tol
 
-        self._url_to_id: Dict[str, int]   = {}
-        self._id_to_url: Dict[int, str]   = {}
-        self._out_edges: Dict[int, List[int]] = defaultdict(list)
-        self._in_edges:  Dict[int, List[int]] = defaultdict(list)
-        self._scores:    Dict[int, float]  = {}
+        self._url_to_id: dict[str, int]   = {}
+        self._id_to_url: dict[int, str]   = {}
+        self._out_edges: dict[int, list[int]] = defaultdict(list)
+        self._in_edges:  dict[int, list[int]] = defaultdict(list)
+        self._scores:    dict[int, float]  = {}
         self._dirty = True
 
     # ------------------------------------------------------------------
@@ -70,11 +69,11 @@ class LinkGraph:
             return
 
         ids = list(self._url_to_id.values())
-        rank: Dict[int, float] = {i: 1.0 / n for i in ids}
+        rank: dict[int, float] = {i: 1.0 / n for i in ids}
         d = self.damping
 
         for _ in range(self.iterations):
-            new_rank: Dict[int, float] = {}
+            new_rank: dict[int, float] = {}
             delta = 0.0
 
             # dangling_sum is the same for every node — compute once per iteration
@@ -139,7 +138,7 @@ class LinkGraph:
         }
 
     @classmethod
-    def from_dict(cls, data: dict, **kwargs) -> "LinkGraph":
+    def from_dict(cls, data: dict, **kwargs) -> LinkGraph:
         g = cls(**kwargs)
         g._url_to_id = data["nodes"]
         g._id_to_url = {v: k for k, v in data["nodes"].items()}

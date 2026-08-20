@@ -11,12 +11,11 @@ Also provides a standalone batch scorer for offline quality audits.
 
 from __future__ import annotations
 
-from typing import Sequence
-
 import numpy as np
 from loguru import logger
 
 from indexer.embedder import Embedder
+
 from .hybrid_retriever import SearchResult
 
 

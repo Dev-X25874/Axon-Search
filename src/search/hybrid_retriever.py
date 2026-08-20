@@ -16,17 +16,15 @@ The final list is sent to CrossEncoderReranker for re-scoring.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
-import numpy as np
 from loguru import logger
 
+from crawler.link_graph import LinkGraph
 from indexer.bm25 import BM25Index
 from indexer.embedder import Embedder
 from indexer.vector_store import VectorStore
-from crawler.link_graph import LinkGraph
-from .query_processor import ProcessedQuery
 
+from .query_processor import ProcessedQuery
 
 # ---------------------------------------------------------------------------
 # Result model
@@ -38,14 +36,14 @@ class SearchResult:
     url:       str
     title:     str
     score:     float
-    bm25_rank: Optional[int]  = None
-    dense_rank: Optional[int] = None
+    bm25_rank: int | None  = None
+    dense_rank: int | None = None
     rrf_score:  float          = 0.0
     pagerank:   float          = 0.0
     metadata:   dict           = field(default_factory=dict)
     snippet:    str            = ""
     # Filled in by reranker
-    rerank_score: Optional[float] = None
+    rerank_score: float | None = None
 
     @property
     def final_score(self) -> float:

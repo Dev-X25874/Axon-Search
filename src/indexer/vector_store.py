@@ -21,7 +21,6 @@ import faiss
 import numpy as np
 from loguru import logger
 
-
 IndexType = Literal["flat", "ivf", "hnsw"]
 
 
@@ -206,7 +205,7 @@ class VectorStore:
         logger.info(f"VectorStore saved to {directory} ({len(self)} vectors)")
 
     @classmethod
-    def load(cls, directory: str | Path, dim: int, **kwargs) -> "VectorStore":
+    def load(cls, directory: str | Path, dim: int, **kwargs) -> VectorStore:
         directory = Path(directory)
         store = cls(dim, **kwargs)
         store._index = faiss.read_index(str(directory / "faiss.index"))

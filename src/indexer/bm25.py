@@ -254,7 +254,7 @@ class BM25Index:
         logger.info(f"BM25 index saved to {path} ({len(self)} docs)")
 
     @classmethod
-    def load(cls, path: str | Path) -> "BM25Index":
+    def load(cls, path: str | Path) -> BM25Index:
         with open(path, "rb") as f:
             data = pickle.load(f)
         idx = cls(k1=data["k1"], b=data["b"])

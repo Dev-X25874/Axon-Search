@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 from urllib.robotparser import RobotFileParser
 
 import aiohttp
@@ -23,7 +23,7 @@ _FETCH_TIMEOUT = 10.0
 
 
 class _CachedRobots:
-    __slots__ = ("parser", "crawl_delay", "fetched_at")
+    __slots__ = ("crawl_delay", "fetched_at", "parser")
 
     def __init__(self, parser: RobotFileParser, crawl_delay: float):
         self.parser       = parser

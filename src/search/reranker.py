@@ -14,14 +14,11 @@ Default model: cross-encoder/ms-marco-MiniLM-L-12-v2
 
 from __future__ import annotations
 
-from typing import Sequence
-
 import numpy as np
 from loguru import logger
 from sentence_transformers.cross_encoder import CrossEncoder
 
 from .hybrid_retriever import SearchResult
-from indexer.bm25 import BM25Index
 
 
 class CrossEncoderReranker:

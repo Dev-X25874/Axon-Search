@@ -15,8 +15,7 @@ Features
 from __future__ import annotations
 
 import hashlib
-from functools import lru_cache
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 from loguru import logger

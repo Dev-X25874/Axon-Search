@@ -14,8 +14,8 @@ import asyncio
 import ipaddress
 import socket
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Set
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -151,7 +151,7 @@ class AsyncCrawler:
 
         self._robots = RobotsCache()
         self._buckets: dict[str, _DomainBucket] = {}
-        self._seen: Set[str] = set()
+        self._seen: set[str] = set()
         self._session: aiohttp.ClientSession | None = None
 
     # ------------------------------------------------------------------

@@ -14,10 +14,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
 
 import nltk
-from loguru import logger
 
 for _r in ("wordnet", "averaged_perceptron_tagger", "punkt"):
     try:
@@ -27,18 +25,17 @@ for _r in ("wordnet", "averaged_perceptron_tagger", "punkt"):
 
 from nltk.corpus import wordnet
 
-
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
 
 @dataclass
 class ParsedOperators:
-    site:     Optional[str] = None
-    filetype: Optional[str] = None
-    date_from: Optional[str] = None
-    date_to:   Optional[str] = None
-    language:  Optional[str] = None
+    site:     str | None = None
+    filetype: str | None = None
+    date_from: str | None = None
+    date_to:   str | None = None
+    language:  str | None = None
     exclude_terms: list[str] = field(default_factory=list)
     must_include:  list[str] = field(default_factory=list)
 
@@ -54,7 +51,7 @@ class ProcessedQuery:
     intent:         str              # informational | navigational | transactional
     is_question:    bool
     # Set by HybridRetriever after embedding
-    query_vector:   Optional[object] = None
+    query_vector:   object | None = None
 
 
 # ---------------------------------------------------------------------------

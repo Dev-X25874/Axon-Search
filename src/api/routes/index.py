@@ -11,7 +11,6 @@ GET    /index/jobs/{job_id} — check a single job's status
 
 from __future__ import annotations
 
-import asyncio
 import time
 import uuid
 from typing import Any
