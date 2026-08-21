@@ -1,227 +1,219 @@
 """
-/index routes — on-demand crawl & index, deletion, and stats.
+Content extraction pipeline.
 
-POST   /index/url         — crawl and index one URL (synchronous, await)
-DELETE /index/url          — soft-delete an indexed URL
-POST   /index/batch       — launch a background crawl job (async)
-GET    /index/stats       — current index statistics
-GET    /index/jobs         — list recent background jobs
-GET    /index/jobs/{job_id} — check a single job's status
+Turns raw HTML into structured, clean text using a cascade:
+  1. trafilatura  (best at article/blog content)
+  2. readability  (fallback for more structured pages)
+  3. raw BS4 body text (last resort)
+
+Also extracts metadata: title, description, publish date, language,
+canonical URL, author, outlinks.
 """
 
 from __future__ import annotations
 
-import time
-import uuid
-from typing import Any
+import re
+from dataclasses import dataclass, field
+from urllib.parse import urlparse
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+import trafilatura
+from bs4 import BeautifulSoup
 from loguru import logger
+from readability import Document
 
-from api.schemas import (
-    DeleteURLResponse,
-    IndexBatchRequest,
-    IndexJobStatus,
-    IndexStatsResponse,
-    IndexURLRequest,
-)
-from crawler.async_crawler import AsyncCrawler
-from crawler.content_extractor import ContentExtractor
-from indexer.pipeline import IndexPipeline
+from .async_crawler import CrawlResult
 
-router = APIRouter()
+# ---------------------------------------------------------------------------
+# Output model
+# ---------------------------------------------------------------------------
 
-# In-memory job registry (replace with Redis/DB for production).
-# Insertion order == chronological order, so listing just needs to
-# read this dict in (reverse) insertion order.
-_JOBS: dict[str, IndexJobStatus] = {}
+@dataclass
+class ExtractedPage:
+    url: str
+    canonical_url: str
+    title: str
+    text: str                       # main body text, clean
+    description: str = ""
+    author: str = ""
+    language: str = "en"
+    publish_date: str = ""
+    outlinks: list[str] = field(default_factory=list)
+    word_count: int = 0
+    char_count: int = 0
+    # Quality signals
+    link_density: float = 0.0      # links / total words
+    avg_sentence_len: float = 0.0
+
+    def is_valid(self, min_words: int = 50) -> bool:
+        return self.word_count >= min_words and bool(self.text.strip())
 
 
 # ---------------------------------------------------------------------------
-# Single URL indexing
+# Extractor
 # ---------------------------------------------------------------------------
 
-@router.post("/url", response_model=IndexJobStatus)
-async def index_url(req: IndexURLRequest, request: Request) -> IndexJobStatus:
-    """Crawl and index a single URL synchronously."""
-    url   = str(req.url)
-    state = request.app.state
-
-    crawler   = AsyncCrawler(max_depth=req.depth, max_pages=500, concurrency=8)
-    extractor = ContentExtractor()
-    pipeline  = _build_pipeline(state, crawler, extractor)
-
-    t0 = time.monotonic()
-    try:
-        stats = await pipeline.run([url])
-    except Exception as exc:  # noqa: BLE001 — API boundary: convert any pipeline failure to a 500
-        logger.exception(f"Index URL failed: {exc}")
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    job = IndexJobStatus(
-        job_id=str(uuid.uuid4()),
-        status="done",
-        crawled=stats.crawled,
-        indexed=stats.indexed,
-        elapsed_s=round(time.monotonic() - t0, 2),
-        created_at=time.time(),
-    )
-    _JOBS[job.job_id] = job
-    return job
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_MULTI_SPACE    = re.compile(r"\s{2,}")
+_MULTI_NEWLINE  = re.compile(r"\n{3,}")
 
 
-@router.delete("/url", response_model=DeleteURLResponse)
-async def delete_url(
-    request: Request,
-    url: str = Query(..., description="Exact indexed URL to remove"),
-) -> DeleteURLResponse:
+class ContentExtractor:
     """
-    Soft-delete a previously indexed URL.
-
-    Removes the document from BM25 and vector search results (and frees
-    the search cache) without a full index rebuild. The document stays
-    on disk as a tombstone until the index is rebuilt from scratch.
+    Stateless extractor — call extract(crawl_result) per page.
+    Thread-safe (no shared mutable state).
     """
-    state = request.app.state
-    bm25  = state.bm25
 
-    doc_id = bm25.url_to_doc_id(url)
-    if doc_id is None:
-        raise HTTPException(status_code=404, detail=f"URL not found in index: {url}")
+    def extract(self, page: CrawlResult) -> ExtractedPage | None:
+        html = page.html
+        url  = page.final_url or page.url
 
-    bm25.delete(doc_id)
-    state.vector_store.delete(doc_id)
+        try:
+            text = self._extract_text(html, url)
+            if not text:
+                return None
 
-    cache = getattr(state, "search_cache", None)
-    if cache is not None:
-        cache.clear()  # stale results may reference the deleted doc_id
+            meta   = self._extract_meta(html, url)
+            stats  = self._compute_stats(html, text)
 
-    logger.info(f"Deleted url={url!r} doc_id={doc_id}")
-    return DeleteURLResponse(deleted=True, url=url, doc_id=doc_id)
+            return ExtractedPage(
+                url=url,
+                canonical_url=meta.get("canonical", url),
+                title=meta.get("title", ""),
+                text=text,
+                description=meta.get("description", ""),
+                author=meta.get("author", ""),
+                language=meta.get("language", "en"),
+                publish_date=meta.get("date", ""),
+                outlinks=meta.get("outlinks", []),
+                word_count=stats["word_count"],
+                char_count=stats["char_count"],
+                link_density=stats["link_density"],
+                avg_sentence_len=stats["avg_sentence_len"],
+            )
+        except Exception as exc:  # noqa: BLE001 — page-level extraction boundary, one bad page must not stop the crawl
+            logger.warning(f"Extraction failed for {url}: {exc}")
+            return None
 
+    # ------------------------------------------------------------------
+    # Text extraction cascade
+    # ------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Batch crawl job (background)
-# ---------------------------------------------------------------------------
-
-@router.post("/batch", response_model=IndexJobStatus)
-async def index_batch(
-    req: IndexBatchRequest,
-    background_tasks: BackgroundTasks,
-    request: Request,
-) -> IndexJobStatus:
-    """Queue a batch crawl job; returns immediately with job_id."""
-    job_id = str(uuid.uuid4())
-    job    = IndexJobStatus(job_id=job_id, status="pending", created_at=time.time())
-    _JOBS[job_id] = job
-
-    state = request.app.state
-    seeds = [str(u) for u in req.seeds]
-
-    background_tasks.add_task(
-        _run_batch_job,
-        job_id=job_id,
-        seeds=seeds,
-        max_pages=req.max_pages,
-        max_depth=req.max_depth,
-        concurrency=req.concurrency,
-        state=state,
-    )
-    return job
-
-
-@router.get("/jobs", response_model=list[IndexJobStatus])
-async def list_jobs(
-    limit: int = Query(50, ge=1, le=500),
-    status: str | None = Query(None, description="Filter by status: pending|running|done|failed"),
-) -> list[IndexJobStatus]:
-    """List background jobs, most recent first."""
-    jobs = list(_JOBS.values())
-    if status:
-        jobs = [j for j in jobs if j.status == status]
-    jobs.sort(key=lambda j: j.created_at, reverse=True)
-    return jobs[:limit]
-
-
-@router.get("/jobs/{job_id}", response_model=IndexJobStatus)
-async def get_job(job_id: str) -> IndexJobStatus:
-    if job_id not in _JOBS:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    return _JOBS[job_id]
-
-
-# ---------------------------------------------------------------------------
-# Stats
-# ---------------------------------------------------------------------------
-
-@router.get("/stats", response_model=IndexStatsResponse)
-async def get_stats(request: Request) -> IndexStatsResponse:
-    state = request.app.state
-    return IndexStatsResponse(
-        bm25_docs=len(state.bm25),
-        vector_docs=len(state.vector_store),
-        graph_nodes=state.link_graph.node_count(),
-        graph_edges=state.link_graph.edge_count(),
-        bm25_deleted=state.bm25.deleted_count(),
-        vector_deleted=state.vector_store.deleted_count(),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Background job runner
-# ---------------------------------------------------------------------------
-
-async def _run_batch_job(
-    job_id: str,
-    seeds: list[str],
-    max_pages: int,
-    max_depth: int,
-    concurrency: int,
-    state: Any,
-) -> None:
-    job = _JOBS[job_id]
-    job.status = "running"
-    t0 = time.monotonic()
-
-    try:
-        crawler   = AsyncCrawler(
-            max_depth=max_depth,
-            max_pages=max_pages,
-            concurrency=concurrency,
+    def _extract_text(self, html: str, url: str) -> str:
+        # --- Attempt 1: trafilatura ---
+        text = trafilatura.extract(
+            html,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,
+            favor_precision=True,
         )
-        extractor = ContentExtractor()
-        pipeline  = _build_pipeline(state, crawler, extractor)
-        stats     = await pipeline.run(seeds)
+        if text and len(text.split()) >= 50:
+            return self._clean(text)
 
-        job.status    = "done"
-        job.crawled   = stats.crawled
-        job.indexed   = stats.indexed
-        job.elapsed_s = round(time.monotonic() - t0, 2)
+        # --- Attempt 2: readability ---
+        try:
+            doc  = Document(html)
+            body = BeautifulSoup(doc.summary(), "lxml").get_text(separator="\n")
+            body = self._clean(body)
+            if len(body.split()) >= 50:
+                return body
+        except Exception as exc:  # noqa: BLE001 — fallback extraction attempt, next cascade step handles the miss
+            logger.debug(f"readability extraction failed for {url}, falling back: {exc}")
 
-        cache = getattr(state, "search_cache", None)
-        if cache is not None and stats.indexed:
-            cache.clear()  # newly indexed docs invalidate cached result sets
+        # --- Attempt 3: raw body text ---
+        soup = BeautifulSoup(html, "lxml")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+        raw = soup.get_text(separator="\n")
+        return self._clean(raw)
 
-    except Exception as exc:  # noqa: BLE001 — background job boundary: record failure, never crash the worker
-        logger.exception(f"Batch job {job_id} failed: {exc}")
-        job.status = "failed"
-        job.error  = str(exc)
-        job.elapsed_s = round(time.monotonic() - t0, 2)
+    # ------------------------------------------------------------------
+    # Metadata extraction
+    # ------------------------------------------------------------------
 
+    def _extract_meta(self, html: str, url: str) -> dict:
+        soup = BeautifulSoup(html, "lxml")
+        meta: dict = {"outlinks": []}
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
+        # Title
+        title_tag = soup.find("title")
+        og_title  = soup.find("meta", property="og:title")
+        meta["title"] = (
+            og_title["content"] if og_title and og_title.get("content")
+            else (title_tag.get_text(strip=True) if title_tag else "")
+        )
 
-def _build_pipeline(state: Any, crawler: AsyncCrawler, extractor: ContentExtractor) -> IndexPipeline:
-    from indexer.pipeline import IndexPipeline
-    return IndexPipeline(
-        crawler=crawler,
-        extractor=extractor,
-        quality=state.quality,
-        dedup=state.dedup,
-        embedder=state.embedder,
-        bm25=state.bm25,
-        vector_store=state.vector_store,
-        link_graph=state.link_graph,
-    )
+        # Description
+        og_desc  = soup.find("meta", property="og:description")
+        std_desc = soup.find("meta", attrs={"name": "description"})
+        meta["description"] = (
+            og_desc["content"] if og_desc and og_desc.get("content")
+            else (std_desc["content"] if std_desc and std_desc.get("content") else "")
+        )
+
+        # Canonical
+        canonical = soup.find("link", rel="canonical")
+        meta["canonical"] = canonical["href"] if canonical and canonical.get("href") else url
+
+        # Author
+        author_meta = soup.find("meta", attrs={"name": "author"})
+        meta["author"] = author_meta["content"] if author_meta and author_meta.get("content") else ""
+
+        # Date — try common patterns
+        for selector in [
+            {"name": "article:published_time"},
+            {"property": "article:published_time"},
+            {"itemprop": "datePublished"},
+            {"name": "pubdate"},
+        ]:
+            tag = soup.find("meta", attrs=selector)
+            if tag and tag.get("content"):
+                meta["date"] = tag["content"]
+                break
+        else:
+            meta["date"] = ""
+
+        # Language
+        html_tag = soup.find("html")
+        meta["language"] = html_tag.get("lang", "en").split("-")[0] if html_tag else "en"
+
+        # Outlinks (absolute)
+        base_domain = urlparse(url).netloc
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.startswith("http") and urlparse(href).netloc != base_domain:
+                meta["outlinks"].append(href)
+
+        return meta
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    def _compute_stats(self, html: str, text: str) -> dict:
+        words = text.split()
+        sentences = [s for s in _SENTENCE_SPLIT.split(text) if s.strip()]
+        avg_sent = len(words) / max(len(sentences), 1)
+
+        # Link density: count anchor text words in raw HTML
+        soup = BeautifulSoup(html, "lxml")
+        link_words = sum(len(a.get_text().split()) for a in soup.find_all("a"))
+        density = link_words / max(len(words), 1)
+
+        return {
+            "word_count": len(words),
+            "char_count": len(text),
+            "link_density": round(density, 4),
+            "avg_sentence_len": round(avg_sent, 2),
+        }
+
+    # ------------------------------------------------------------------
+    # Cleaner
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        text = _MULTI_SPACE.sub(" ", text)
+        text = _MULTI_NEWLINE.sub("\n\n", text)
+        return text.strip()
