@@ -16,6 +16,7 @@ import socket
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from typing import ClassVar
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -28,17 +29,27 @@ from .robots import RobotsCache
 
 def _is_private_host(host: str) -> bool:
     """
-    True if `host` resolves to a loopback / private / link-local /
-    reserved address. Used to stop the crawler being pointed at
-    internal services (e.g. http://169.254.169.254/, http://localhost,
-    http://10.0.0.1) via a crafted seed URL or an outlink discovered on
-    a crawled page — a classic SSRF vector for any crawler that fetches
-    externally-supplied URLs.
+    True if `host` does not resolve to a globally-routable address —
+    loopback / private (RFC1918) / link-local / other non-public ranges.
+    Used to stop the crawler being pointed at internal services (e.g.
+    http://169.254.169.254/, http://localhost, http://10.0.0.1) via a
+    crafted seed URL or an outlink discovered on a crawled page — a
+    classic SSRF vector for any crawler that fetches externally-supplied
+    URLs.
+
+    Uses `is_global` rather than checking is_private/is_loopback/
+    is_link_local/is_reserved individually: on IPv6-only networks with
+    NAT64/DNS64 (common on mobile carriers), public IPv4 addresses get
+    synthesized into the 64:ff9b::/96 well-known prefix, which Python's
+    ipaddress module flags as is_reserved=True even though it's a fully
+    public, routable address (is_global=True). Checking `is_global`
+    directly still blocks every genuinely private/loopback/link-local
+    target while correctly allowing NAT64-translated public addresses.
     """
     try:
         # host may already be a literal IP
         addr = ipaddress.ip_address(host)
-        return addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved
+        return not addr.is_global
     except ValueError:
         pass
 
@@ -55,7 +66,7 @@ def _is_private_host(host: str) -> bool:
             addr = ipaddress.ip_address(ip)
         except ValueError:
             continue
-        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+        if not addr.is_global:
             return True
     return False
 
@@ -115,7 +126,7 @@ class AsyncCrawler:
         process(result)
     """
 
-    DEFAULT_HEADERS = {
+    DEFAULT_HEADERS: ClassVar[dict[str, str]] = {
         "User-Agent": (
             "AxonSearchBot/0.1 (+https://github.com/axon-search; "
             "research crawler; contact: crawler@axon.search)"
@@ -189,7 +200,7 @@ class AsyncCrawler:
                 async with semaphore:
                     try:
                         result = await self._fetch_one(url, depth, parent)
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 — must never let one bad URL hang the crawl
                         # _fetch_one is wrapped in @retry(reraise=False); once all
                         # attempts are exhausted it raises RetryError here. If we
                         # don't catch it, this task never reaches the
@@ -337,4 +348,3 @@ class AsyncCrawler:
             abs_url = urljoin(base_url, href).split("#")[0]
             links.append(abs_url)
         return links
-        
