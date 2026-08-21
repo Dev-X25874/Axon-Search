@@ -90,7 +90,7 @@ class ContentExtractor:
                 link_density=stats["link_density"],
                 avg_sentence_len=stats["avg_sentence_len"],
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — page-level extraction boundary, one bad page must not stop the crawl
             logger.warning(f"Extraction failed for {url}: {exc}")
             return None
 
@@ -118,8 +118,8 @@ class ContentExtractor:
             body = self._clean(body)
             if len(body.split()) >= 50:
                 return body
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001 — fallback extraction attempt, next cascade step handles the miss
+            logger.debug(f"readability extraction failed for {url}, falling back: {exc}")
 
         # --- Attempt 3: raw body text ---
         soup = BeautifulSoup(html, "lxml")
