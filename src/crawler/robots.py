@@ -123,7 +123,7 @@ class RobotsCache:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, parser.read)
 
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 — unreachable/malformed robots.txt must not block the crawl
             logger.debug(f"robots.txt fetch failed for {domain}: {exc} — assuming allow-all")
             parser.allow_all = True
 
