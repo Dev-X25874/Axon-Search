@@ -54,7 +54,7 @@ async def index_url(req: IndexURLRequest, request: Request) -> IndexJobStatus:
     t0 = time.monotonic()
     try:
         stats = await pipeline.run([url])
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — API boundary: convert any pipeline failure to a 500
         logger.exception(f"Index URL failed: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
 
@@ -202,7 +202,7 @@ async def _run_batch_job(
         if cache is not None and stats.indexed:
             cache.clear()  # newly indexed docs invalidate cached result sets
 
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — background job boundary: record failure, never crash the worker
         logger.exception(f"Batch job {job_id} failed: {exc}")
         job.status = "failed"
         job.error  = str(exc)
