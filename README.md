@@ -1,4 +1,4 @@
-# axon-search
+# Axon-search
 
 A hybrid semantic search engine.
 
